@@ -25,6 +25,7 @@ public enum ProjectSearch {
     /// Files bigger than this are skipped (likely generated/minified/lock files).
     private static let maxFileBytes = 2_000_000
     private static let maxTotalMatches = 5_000
+    private static let maxMatchesPerFile = 200
 
     /// Recursively searches `root` for `query`.
     ///
@@ -55,7 +56,7 @@ public enum ProjectSearch {
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(
             at: root,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
 
@@ -73,7 +74,14 @@ public enum ProjectSearch {
             }
             if SkippedDirs.names.contains(name) { continue }
 
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            // Only read regular files. Symlinks report the size of the LINK
+            // (a few bytes) here while `Data(contentsOf:)` would follow them
+            // and read the whole target — bypassing the size guard — and
+            // special files (FIFOs, sockets, devices) aren't searchable text.
+            let attrs = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard attrs?.isRegularFile == true else { continue }
+
+            let size = attrs?.fileSize ?? 0
             if size > maxFileBytes { continue }
 
             guard let data = try? Data(contentsOf: url),
@@ -104,15 +112,19 @@ public enum ProjectSearch {
         var out: [SearchMatch] = []
         var lineNo = 0
 
-        text.enumerateLines { line, _ in
+        text.enumerateLines { line, stop in
             lineNo += 1
+            if out.count >= maxMatchesPerFile {   // per-file cap
+                stop = true
+                return
+            }
             let ns = line as NSString
             let full = NSRange(location: 0, length: ns.length)
 
             if let regex {
                 for m in regex.matches(in: line, options: [], range: full) {
+                    if out.count >= maxMatchesPerFile { break }
                     out.append(SearchMatch(line: lineNo, lineText: line, range: m.range))
-                    if out.count > 200 { break }   // per-file cap
                 }
             } else {
                 var searchStart = 0
@@ -121,9 +133,9 @@ public enum ProjectSearch {
                     let r = ns.range(of: query, options: opts,
                                      range: NSRange(location: searchStart, length: ns.length - searchStart))
                     if r.location == NSNotFound { break }
+                    if out.count >= maxMatchesPerFile { break }
                     out.append(SearchMatch(line: lineNo, lineText: line, range: r))
                     searchStart = NSMaxRange(r) > r.location ? NSMaxRange(r) : r.location + 1
-                    if out.count > 200 { break }
                 }
             }
         }

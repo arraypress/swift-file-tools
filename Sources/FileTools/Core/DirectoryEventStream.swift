@@ -30,9 +30,30 @@ public final class DirectoryEventStream {
     /// A callback invoked with every batch of events since the last notification.
     public typealias EventCallback = ([Event]) -> Void
 
+    /// Bridges the C callback to the stream without extending its lifetime.
+    ///
+    /// The FSEvents context holds an unretained pointer, so the callback must
+    /// never dereference `DirectoryEventStream` directly — a callback already
+    /// in flight when the last strong reference drops would touch freed
+    /// memory. The box is kept alive by the stream instance, and the `weak`
+    /// load safely yields `nil` once deinit has begun.
+    private final class CallbackBox {
+        weak var owner: DirectoryEventStream?
+        init(owner: DirectoryEventStream) { self.owner = owner }
+    }
+
+    private static let queueKey = DispatchSpecificKey<Void>()
+
     private var streamRef: FSEventStreamRef?
     private var callback: EventCallback
     private let debounceDuration: TimeInterval
+    /// Serial queue events are delivered on; `cancel()` synchronizes on it so
+    /// teardown waits for any in-flight callback and is safe to call from
+    /// multiple threads.
+    private let eventQueue: DispatchQueue
+    /// Kept alive for the lifetime of the object so the context's unretained
+    /// pointer stays valid for as long as a callback could possibly run.
+    private var callbackBox: CallbackBox?
 
     /// A single file-system change: the affected `path` and its ``FSEvent`` kind.
     public struct Event {
@@ -61,42 +82,53 @@ public final class DirectoryEventStream {
     public init(directory: String, debounceDuration: TimeInterval = 0.1, callback: @escaping EventCallback) {
         self.debounceDuration = debounceDuration
         self.callback = callback
-        let selfPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        self.eventQueue = DispatchQueue(label: "FileTools.DirectoryEventStream")
+        eventQueue.setSpecific(key: Self.queueKey, value: ())
+
+        let box = CallbackBox(owner: self)
+        self.callbackBox = box
+        let boxPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(box).toOpaque())
 
         var context = FSEventStreamContext(
             version: 0,
-            info: selfPtr,
+            info: boxPtr,
             retain: nil,
             release: nil,
             copyDescription: nil
         )
-        let contextPtr = withUnsafeMutablePointer(to: &context) { ptr in UnsafeMutablePointer(ptr) }
 
         let cfDirectory = directory as CFString
         let pathsToWatch = [cfDirectory] as CFArray
 
-        if let ref = FSEventStreamCreate(
-            kCFAllocatorDefault,
-            { streamRef, clientCallBackInfo, numEvents, eventPaths, eventFlags, eventIds in
-                guard let clientCallBackInfo else { return }
-                Unmanaged<DirectoryEventStream>
-                    .fromOpaque(clientCallBackInfo)
-                    .takeUnretainedValue()
-                    .eventStreamHandler(streamRef, numEvents, eventPaths, eventFlags, eventIds)
-            },
-            contextPtr,
-            pathsToWatch,
-            UInt64(kFSEventStreamEventIdSinceNow),
-            debounceDuration,
-            FSEventStreamCreateFlags(
-                kFSEventStreamCreateFlagUseCFTypes
-                | kFSEventStreamCreateFlagFileEvents
-                | kFSEventStreamCreateFlagUseExtendedData
-                | kFSEventStreamCreateFlagNoDefer
+        // The context pointer is only valid inside this closure, so the
+        // stream must be created here (FSEventStreamCreate copies the struct).
+        let ref = withUnsafeMutablePointer(to: &context) { contextPtr in
+            FSEventStreamCreate(
+                kCFAllocatorDefault,
+                { streamRef, clientCallBackInfo, numEvents, eventPaths, eventFlags, eventIds in
+                    guard let clientCallBackInfo else { return }
+                    Unmanaged<CallbackBox>
+                        .fromOpaque(clientCallBackInfo)
+                        .takeUnretainedValue()
+                        .owner?
+                        .eventStreamHandler(streamRef, numEvents, eventPaths, eventFlags, eventIds)
+                },
+                contextPtr,
+                pathsToWatch,
+                UInt64(kFSEventStreamEventIdSinceNow),
+                debounceDuration,
+                FSEventStreamCreateFlags(
+                    kFSEventStreamCreateFlagUseCFTypes
+                    | kFSEventStreamCreateFlagFileEvents
+                    | kFSEventStreamCreateFlagUseExtendedData
+                    | kFSEventStreamCreateFlagNoDefer
+                )
             )
-        ) {
+        }
+
+        if let ref {
             self.streamRef = ref
-            FSEventStreamSetDispatchQueue(ref, DispatchQueue.global(qos: .default))
+            FSEventStreamSetDispatchQueue(ref, eventQueue)
             FSEventStreamStart(ref)
         }
     }
@@ -106,13 +138,27 @@ public final class DirectoryEventStream {
     }
 
     /// Cancels the events watcher. Re-initialize to begin streaming again.
+    ///
+    /// Thread-safe and idempotent: teardown is serialized on the event queue,
+    /// so it waits for any in-flight callback to finish and concurrent calls
+    /// cannot double-release the stream.
     public func cancel() {
-        if let streamRef {
-            FSEventStreamStop(streamRef)
-            FSEventStreamInvalidate(streamRef)
-            FSEventStreamRelease(streamRef)
+        // Run inline when already on the event queue (e.g. cancel() called
+        // from inside the client callback) — `sync` there would deadlock.
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            stopStream()
+        } else {
+            eventQueue.sync { self.stopStream() }
         }
-        streamRef = nil
+    }
+
+    /// Must be called on `eventQueue`.
+    private func stopStream() {
+        guard let streamRef else { return }
+        FSEventStreamStop(streamRef)
+        FSEventStreamInvalidate(streamRef)
+        FSEventStreamRelease(streamRef)
+        self.streamRef = nil
     }
 
     private func eventStreamHandler(
@@ -142,12 +188,10 @@ public final class DirectoryEventStream {
     }
 
     /// Parses ``FSEvent`` from the raw flag value. There can be multiple events in one raw flag.
-    private func getEventsFromFlags(_ raw: FSEventStreamEventFlags) -> Set<FSEvent> {
+    /// Internal (not private) so tests can exercise the flag mapping directly.
+    func getEventsFromFlags(_ raw: FSEventStreamEventFlags) -> Set<FSEvent> {
         var events: Set<FSEvent> = []
 
-        if raw == 0 {
-            events.insert(.changeInDirectory)
-        }
         if raw & UInt32(kFSEventStreamEventFlagRootChanged) > 0 {
             events.insert(.rootChanged)
         }
@@ -168,6 +212,15 @@ public final class DirectoryEventStream {
         }
         if raw & UInt32(kFSEventStreamEventFlagItemRenamed) > 0 {
             events.insert(.itemRenamed)
+        }
+
+        // raw == 0 (a plain "something in this directory changed") and flag
+        // values with no recognized item bits — most importantly
+        // kFSEventStreamEventFlagMustScanSubDirs, which FSEvents sends when
+        // events were coalesced/dropped and the client MUST rescan — must not
+        // be silently swallowed. Surface them as a generic directory change.
+        if events.isEmpty {
+            events.insert(.changeInDirectory)
         }
 
         return events

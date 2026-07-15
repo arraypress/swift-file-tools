@@ -150,6 +150,45 @@ final class FileToolsTests: XCTestCase {
         XCTAssertEqual(results.first?.url.lastPathComponent, "keep.txt")
     }
 
+    func testProjectSearchSkipsSymlinks() throws {
+        // A symlink's own size (a few bytes) used to pass the 2MB guard while
+        // Data(contentsOf:) followed the link and read the whole target.
+        // Non-regular files must be skipped outright.
+        let targetDir = tmp.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: targetDir, withIntermediateDirectories: true)
+        let target = targetDir.appendingPathComponent("big.txt")
+        // A >2MB target that contains the query — over the per-file size cap.
+        var contents = String(repeating: "x", count: 2_100_000)
+        contents += "\nhello target\n"
+        try contents.write(to: target, atomically: true, encoding: .utf8)
+
+        let root = tmp.appendingPathComponent("repo", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "no match\n".write(to: root.appendingPathComponent("plain.txt"),
+                               atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("link.txt"), withDestinationURL: target)
+
+        let results = ProjectSearch.search(
+            query: "hello", in: root, caseSensitive: false, regex: false, isCancelled: { false })
+        XCTAssertTrue(results.isEmpty, "symlinked oversized target must not be read or matched")
+    }
+
+    func testProjectSearchCapsMatchesPerFile() throws {
+        // The per-file cap used to only break the per-line loop; a file where
+        // every line matches kept accumulating one match per line.
+        let lines = Array(repeating: "error hello error", count: 1_000).joined(separator: "\n")
+        try write(lines, to: "noisy.log")
+
+        let plain = ProjectSearch.search(
+            query: "error", in: tmp, caseSensitive: false, regex: false, isCancelled: { false })
+        XCTAssertEqual(plain.first?.matches.count, 200, "per-file cap should hold at 200")
+
+        let regex = ProjectSearch.search(
+            query: "err\\w+", in: tmp, caseSensitive: false, regex: true, isCancelled: { false })
+        XCTAssertEqual(regex.first?.matches.count, 200, "per-file cap should hold at 200 for regex")
+    }
+
     func testProjectSearchRespectsCancellation() throws {
         try write("hello\n", to: "a.txt")
         let results = ProjectSearch.search(
@@ -221,5 +260,55 @@ final class FileToolsTests: XCTestCase {
         XCTAssertEqual(event.path, "/tmp/x")
         XCTAssertEqual(event.eventType, .itemModified)
         XCTAssertEqual(FSEvent.itemCreated.rawValue, "itemCreated")
+    }
+
+    func testDirectoryEventStreamCancelIsIdempotent() {
+        // cancel() used to be able to double-release the stream when raced;
+        // it is now serialized and must be safe to call repeatedly.
+        let stream = DirectoryEventStream(directory: tmp.path) { _ in }
+        stream.cancel()
+        stream.cancel()
+        stream.cancel()
+    }
+
+    func testDirectoryEventStreamDeliversEvents() {
+        // End-to-end sanity for the FSEventStreamContext rework (weak box +
+        // serial queue + create-inside-closure): the stream must still
+        // deliver events for real file changes.
+        let delivered = expectation(description: "FSEvents delivered")
+        delivered.assertForOverFulfill = false
+        let stream = DirectoryEventStream(directory: tmp.path, debounceDuration: 0.05) { events in
+            if !events.isEmpty { delivered.fulfill() }
+        }
+        defer { stream.cancel() }
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { [tmp] in
+            try? "changed".write(to: tmp!.appendingPathComponent("touched.txt"),
+                                 atomically: true, encoding: .utf8)
+        }
+        wait(for: [delivered], timeout: 10)
+    }
+
+    func testGetEventsFromFlagsSurfacesUnrecognizedFlags() {
+        // Flags with no recognized item bits — most importantly
+        // kFSEventStreamEventFlagMustScanSubDirs (FSEvents coalesced/dropped
+        // events, client must rescan) — used to yield an empty set and the
+        // event was silently dropped.
+        let stream = DirectoryEventStream(directory: tmp.path) { _ in }
+        defer { stream.cancel() }
+
+        XCTAssertEqual(
+            stream.getEventsFromFlags(FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)),
+            [.changeInDirectory])
+        XCTAssertEqual(
+            stream.getEventsFromFlags(FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped)),
+            [.changeInDirectory])
+        // raw == 0 keeps its existing mapping.
+        XCTAssertEqual(stream.getEventsFromFlags(0), [.changeInDirectory])
+        // Recognized item bits keep their specific mapping (no spurious
+        // .changeInDirectory added).
+        XCTAssertEqual(
+            stream.getEventsFromFlags(FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified)),
+            [.itemModified])
     }
 }
