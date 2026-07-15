@@ -59,11 +59,15 @@ public enum RecentItems {
 
     // MARK: - Internal
 
+    /// Reads the stored path list for `key`, dropping paths that no longer
+    /// exist on disk.
     private static func paths(for key: String) -> [String] {
         (UserDefaults.standard.stringArray(forKey: key) ?? [])
             .filter { FileManager.default.fileExists(atPath: $0) }
     }
 
+    /// Moves `path` to the front of the stored list for `key`, deduplicating
+    /// and trimming to `max` entries.
     private static func add(_ path: String, to key: String, max: Int) {
         var list = UserDefaults.standard.stringArray(forKey: key) ?? []
         list.removeAll { $0 == path }

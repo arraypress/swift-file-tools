@@ -24,7 +24,9 @@ import Foundation
 public enum ProjectSearch {
     /// Files bigger than this are skipped (likely generated/minified/lock files).
     private static let maxFileBytes = 2_000_000
+    /// The search stops after this many matches across the whole project.
     private static let maxTotalMatches = 5_000
+    /// Per-file cap; scanning of a file stops once it is reached.
     private static let maxMatchesPerFile = 200
 
     /// Recursively searches `root` for `query`.
@@ -38,6 +40,8 @@ public enum ProjectSearch {
     ///     invalid pattern yields no results.
     ///   - isCancelled: Polled between files; return `true` to stop early.
     /// - Returns: One ``SearchFileResult`` per matching file, sorted by path.
+    /// - Note: Performs blocking file I/O for the whole walk — dispatch to a
+    ///   background queue when searching a large project.
     public static func search(
         query: String,
         in root: URL,
@@ -103,6 +107,8 @@ public enum ProjectSearch {
         return results
     }
 
+    /// Finds every match of `query` (or the precompiled `regex`) in `text`,
+    /// line by line, capped at `maxMatchesPerFile`.
     private static func matches(
         in text: String,
         query: String,

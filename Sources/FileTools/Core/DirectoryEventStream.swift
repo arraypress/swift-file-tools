@@ -42,6 +42,8 @@ public final class DirectoryEventStream {
         init(owner: DirectoryEventStream) { self.owner = owner }
     }
 
+    /// Marks `eventQueue` so `cancel()` can detect re-entrant calls made from
+    /// inside the client callback and avoid a `sync` deadlock.
     private static let queueKey = DispatchSpecificKey<Void>()
 
     private var streamRef: FSEventStreamRef?
@@ -161,6 +163,9 @@ public final class DirectoryEventStream {
         self.streamRef = nil
     }
 
+    /// Unpacks a raw FSEvents batch (extended-data dictionaries + flags) into
+    /// ``Event`` values and forwards them to the client callback. Runs on
+    /// `eventQueue`.
     private func eventStreamHandler(
         _ streamRef: ConstFSEventStreamRef,
         _ numEvents: Int,
