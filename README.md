@@ -8,7 +8,7 @@ A small bundle of macOS file utilities for tooling and code-review UIs — an AS
 - 🔍 **Project search** — `ProjectSearch.search(query:in:caseSensitive:regex:isCancelled:)` recursively finds text or regex matches, skipping oversized files, binaries, symlinks and special files, with per-file and total match caps
 - 🕒 **Recent items** — `RecentItems.addFile` / `addFolder` / `files` / `folders`: a persistent, capped, most-recent-first list that drops paths no longer on disk
 - 👀 **Directory watching** — `DirectoryEventStream` streams debounced FSEvents batches as `[Event]` of typed `FSEvent` kinds; `cancel()` is thread-safe and idempotent
-- 🚫 **Noise-aware** — search honors the public `SkippedDirs.names` set (`.git`, `node_modules`, `.build`, `DerivedData`, …); the tree renderer skips the same kind of folders
+- 🚫 **Noise-aware, and configurable** — both scanners honor the one `SkippedDirs.names` set (`.git`, `node_modules`, `.build`, `DerivedData`, …). Matching is by *name*, so the list is settable: a project with real sources in `dist/` can take it off the list, and `SkippedDirs.resetToDefault()` restores `SkippedDirs.defaultNames`
 - 🪶 **Zero dependencies** — Foundation only
 - 🧪 **Tested** — tree rendering, search caps/cancellation/symlink handling, recents persistence, and watcher lifecycle + flag mapping
 
@@ -69,12 +69,17 @@ watcher.cancel()   // thread-safe, idempotent; also runs on deinit
 
 // Reuse the shared noise-directory set in your own scanners.
 if SkippedDirs.names.contains(url.lastPathComponent) { /* skip it */ }
+
+// Override it — this project keeps real sources in dist/, so stop hiding them.
+SkippedDirs.names = SkippedDirs.defaultNames.subtracting(["dist"])
+SkippedDirs.resetToDefault()   // back to the shipped list
 ```
 
 ## Notes
 
 - `ProjectSearch.search` and `FileTree.ascii` are **synchronous** and do blocking file I/O — keep them off the main queue for large projects.
 - Search caps: files over 2 MB are skipped, at most 200 matches per file and 5,000 in total.
+- `SkippedDirs.names` is global mutable state read by both scanners. Set it once during start-up rather than mutating it concurrently with a walk; `FileTree.ascii` snapshots it per render.
 - `DirectoryEventStream` callbacks may arrive on an unpredictable dispatch queue; hop to the main queue before touching UI. Unrecognized or coalesced FSEvents flags are surfaced as `.changeInDirectory` rather than dropped.
 - `RecentItems` persists to `UserDefaults.standard` (caps: 15 files, 5 folders).
 

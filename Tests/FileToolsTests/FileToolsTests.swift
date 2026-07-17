@@ -204,6 +204,43 @@ final class FileToolsTests: XCTestCase {
         }
     }
 
+    func testSkippedDirsOverrideAndReset() {
+        defer { SkippedDirs.resetToDefault() }
+
+        XCTAssertEqual(SkippedDirs.names, SkippedDirs.defaultNames, "starts at the defaults")
+
+        SkippedDirs.names = SkippedDirs.defaultNames.subtracting(["dist"])
+        XCTAssertFalse(SkippedDirs.names.contains("dist"))
+        XCTAssertTrue(SkippedDirs.names.contains(".git"), "the rest of the list survives")
+
+        SkippedDirs.resetToDefault()
+        XCTAssertEqual(SkippedDirs.names, SkippedDirs.defaultNames)
+        XCTAssertTrue(SkippedDirs.names.contains("dist"))
+    }
+
+    /// The whole point of the override: a project with a real `dist/` source
+    /// directory must get it back in every scanner that reads the list.
+    func testRemovingDistFromSkipListRevealsItToTreeAndSearch() throws {
+        defer { SkippedDirs.resetToDefault() }
+        try write("hello from dist\n", to: "dist/app.js")
+
+        // Default list: dist is noise — invisible to both scanners.
+        XCTAssertFalse(FileTree.ascii(of: tmp).contains("dist"))
+        XCTAssertTrue(ProjectSearch.search(
+            query: "hello", in: tmp, caseSensitive: false, regex: false,
+            isCancelled: { false }).isEmpty)
+
+        // Override: dist is real source — both scanners must see it.
+        SkippedDirs.names = SkippedDirs.defaultNames.subtracting(["dist"])
+        let tree = FileTree.ascii(of: tmp)
+        XCTAssertTrue(tree.contains("dist/"), "file tree must show dist once it's off the list")
+        XCTAssertTrue(tree.contains("app.js"))
+        let hits = ProjectSearch.search(
+            query: "hello", in: tmp, caseSensitive: false, regex: false, isCancelled: { false })
+        XCTAssertEqual(hits.first?.url.lastPathComponent, "app.js",
+                       "project search must descend into dist once it's off the list")
+    }
+
     // MARK: - RecentItems
 
     func testRecentItemsAddAndList() throws {

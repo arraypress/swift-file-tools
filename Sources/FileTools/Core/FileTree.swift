@@ -23,18 +23,13 @@ import Foundation
 /// ```
 public enum FileTree {
 
-    /// Directory names that are never descended into or listed.
-    private static let skip: Set<String> = [
-        ".git", ".svn", ".hg", "node_modules", ".build", ".swiftpm", "Pods",
-        "DerivedData", "dist", "build", "__pycache__", ".next", ".cache", "vendor", ".DS_Store",
-    ]
-
     /// Renders `root` and its descendants as an ASCII tree.
     ///
     /// Directories are listed before files and sorted case-insensitively. Noise
-    /// directories (see the skip set) are omitted. Traversal stops descending
-    /// past `maxDepth`, and once `maxEntries` rows have been emitted the output
-    /// is truncated with an ellipsis row.
+    /// directories (``SkippedDirs/names``, read live so a user override applies)
+    /// are omitted. Traversal stops descending past `maxDepth`, and once
+    /// `maxEntries` rows have been emitted the output is truncated with an
+    /// ellipsis row.
     ///
     /// - Parameters:
     ///   - root: The directory to render. Its own name forms the first line.
@@ -45,6 +40,8 @@ public enum FileTree {
         var lines = [root.lastPathComponent + "/"]
         var count = 0
         var truncated = false
+        // Snapshot the skip list once so one rendering can't straddle an override.
+        let skip = SkippedDirs.names
 
         func walk(_ dir: URL, prefix: String, depth: Int) {
             guard depth <= maxDepth, !truncated else { return }
