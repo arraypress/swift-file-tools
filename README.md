@@ -8,9 +8,10 @@ A small bundle of macOS file utilities for tooling and code-review UIs — an AS
 - 🔍 **Project search** — `ProjectSearch.search(query:in:caseSensitive:regex:isCancelled:)` recursively finds text or regex matches, skipping oversized files, binaries, symlinks and special files, with per-file and total match caps
 - 🕒 **Recent items** — `RecentItems.addFile` / `addFolder` / `files` / `folders`: a persistent, capped, most-recent-first list that drops paths no longer on disk
 - 👀 **Directory watching** — `DirectoryEventStream` streams debounced FSEvents batches as `[Event]` of typed `FSEvent` kinds; `cancel()` is thread-safe and idempotent
+- 🏃 **Project scripts** — `ProjectScripts.detect(root:)` lists the runnable tasks in a project's manifests — `package.json` scripts (with the runner picked from the lockfile: npm/pnpm/yarn/bun), `composer.json` scripts (reserved lifecycle hooks filtered out), and `Makefile` targets — each as a `ProjectScript { name, command, source }`. Read-only: it reflects the project, it doesn't run anything
 - 🚫 **Noise-aware, and configurable** — both scanners honor the one `SkippedDirs.names` set (`.git`, `node_modules`, `.build`, `DerivedData`, …). Matching is by *name*, so the list is settable: a project with real sources in `dist/` can take it off the list, and `SkippedDirs.resetToDefault()` restores `SkippedDirs.defaultNames`
 - 🪶 **Zero dependencies** — Foundation only
-- 🧪 **Tested** — tree rendering, search caps/cancellation/symlink handling, recents persistence, and watcher lifecycle + flag mapping
+- 🧪 **Tested** — tree rendering, search caps/cancellation/symlink handling, recents persistence, watcher lifecycle + flag mapping, and manifest script detection (runner choice, reserved-hook filtering, Makefile heuristics)
 
 ## Requirements
 
