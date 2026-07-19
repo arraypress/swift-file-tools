@@ -57,15 +57,38 @@ public enum ProjectSearch {
             : nil
         if regex && regexObj == nil { return [] }   // invalid pattern
 
+        var results: [SearchFileResult] = []
+        var total = 0
+        enumerateTextFiles(in: root, isCancelled: isCancelled) { url, text, _ in
+            let fileMatches = matches(in: text, query: query,
+                                      caseSensitive: caseSensitive, regex: regexObj)
+            guard !fileMatches.isEmpty else { return true }
+            results.append(SearchFileResult(url: url, matches: fileMatches))
+            total += fileMatches.count
+            return total < maxTotalMatches   // stop the walk once the global cap is hit
+        }
+
+        results.sort { $0.url.path.localizedCaseInsensitiveCompare($1.url.path) == .orderedAscending }
+        return results
+    }
+
+    /// Walks `root` yielding each eligible text file's URL + decoded contents,
+    /// applying the shared skip/size/binary guards. `body` returns `false` to stop
+    /// the walk early. The single source of truth for "which files are searchable",
+    /// shared by ``search(query:in:caseSensitive:regex:isCancelled:)`` and
+    /// ``replaceAll(query:in:caseSensitive:regex:replacement:isCancelled:)`` so the
+    /// two can never diverge on what they touch.
+    private static func enumerateTextFiles(
+        in root: URL,
+        isCancelled: () -> Bool,
+        body: (URL, String, String.Encoding) -> Bool
+    ) {
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
-        ) else { return [] }
-
-        var results: [SearchFileResult] = []
-        var total = 0
+        ) else { return }
 
         for case let url as URL in enumerator {
             if isCancelled() { break }
@@ -89,22 +112,22 @@ public enum ProjectSearch {
             if size > maxFileBytes { continue }
 
             guard let data = try? Data(contentsOf: url),
-                  !data.prefix(4000).contains(0),                 // skip binary
-                  let text = String(data: data, encoding: .utf8)
-                    ?? String(data: data, encoding: .isoLatin1)
+                  !data.prefix(4000).contains(0)                  // skip binary
             else { continue }
-
-            let fileMatches = matches(in: text, query: query,
-                                      caseSensitive: caseSensitive, regex: regexObj)
-            if !fileMatches.isEmpty {
-                results.append(SearchFileResult(url: url, matches: fileMatches))
-                total += fileMatches.count
-                if total >= maxTotalMatches { break }
+            // Decode as UTF-8, else fall back to Latin-1. Track WHICH so a rewrite
+            // (replaceAll) can round-trip the file in its original encoding instead
+            // of silently converting a Latin-1 / Windows-1252 file to UTF-8.
+            let text: String, encoding: String.Encoding
+            if let utf8 = String(data: data, encoding: .utf8) {
+                text = utf8; encoding = .utf8
+            } else if let latin1 = String(data: data, encoding: .isoLatin1) {
+                text = latin1; encoding = .isoLatin1
+            } else {
+                continue
             }
-        }
 
-        results.sort { $0.url.path.localizedCaseInsensitiveCompare($1.url.path) == .orderedAscending }
-        return results
+            if !body(url, text, encoding) { break }
+        }
     }
 
     /// Finds every match of `query` (or the precompiled `regex`) in `text`,
@@ -146,5 +169,135 @@ public enum ProjectSearch {
             }
         }
         return out
+    }
+
+    // MARK: - Replace
+
+    /// Replaces every match of `query` with `replacement` across every searchable
+    /// file under `root`. **Destructive** — the caller is expected to confirm first,
+    /// ideally by first calling with `commit: false` (a dry run) to get the exact
+    /// count it then confirms against.
+    ///
+    /// Matching mirrors ``search(query:in:caseSensitive:regex:isCancelled:)`` exactly:
+    /// the same file set, and the regex is applied **per line** (each line without its
+    /// terminator), so `^`/`$` anchor to line boundaries and no pattern can consume a
+    /// newline — a replace can therefore never touch or collapse content the search
+    /// preview didn't surface. In regex mode `replacement` is an `NSRegularExpression`
+    /// template (`$1`, `$2`, … expand); in literal mode it is inserted verbatim. A
+    /// rewritten file keeps its original encoding (UTF-8, else Latin-1).
+    ///
+    /// - Parameters:
+    ///   - query: The literal text or regex pattern (same as search — whole-word is
+    ///     the caller's `\b(?:…)\b` regex wrap).
+    ///   - replacement: The replacement text (regex template when `regex` is true).
+    ///   - commit: When `false`, nothing is written — the returned summary is a dry
+    ///     run reporting exactly what a `commit: true` call would change.
+    ///   - isCancelled: Polled between files; return `true` to stop early. Files
+    ///     already written stay written.
+    /// - Returns: A ``ReplaceSummary`` of files changed (or that would change), total
+    ///   replacements, and files that matched but could not be written.
+    /// - Note: Blocking file I/O for the whole walk — dispatch to the background.
+    public static func replaceAll(
+        query: String,
+        in root: URL,
+        caseSensitive: Bool,
+        regex: Bool,
+        replacement: String,
+        commit: Bool,
+        isCancelled: () -> Bool
+    ) -> ReplaceSummary {
+        guard !query.isEmpty else { return .empty }
+
+        let regexObj: NSRegularExpression?
+        if regex {
+            let opts: NSRegularExpression.Options = caseSensitive ? [] : [.caseInsensitive]
+            guard let r = try? NSRegularExpression(pattern: query, options: opts) else { return .empty }
+            regexObj = r
+        } else {
+            regexObj = nil
+        }
+
+        var filesChanged = 0, totalReplacements = 0, filesFailed = 0
+        enumerateTextFiles(in: root, isCancelled: isCancelled) { url, text, encoding in
+            let (newText, count) = replaced(in: text, query: query, caseSensitive: caseSensitive,
+                                            regex: regexObj, replacement: replacement)
+            guard count > 0, newText != text else { return true }
+            // Round-trip in the file's original encoding. A replacement that adds a
+            // character the encoding can't represent is a FAILURE, not a change —
+            // checked identically in both the dry run and the commit so the dry-run
+            // count the caller confirms against exactly equals what commit writes.
+            guard let data = newText.data(using: encoding) else { filesFailed += 1; return true }
+            if !commit {   // dry run: report what WOULD change, write nothing
+                filesChanged += 1
+                totalReplacements += count
+                return true
+            }
+            do {
+                try data.write(to: url, options: .atomic)
+                filesChanged += 1
+                totalReplacements += count
+            } catch {
+                filesFailed += 1
+            }
+            return true
+        }
+        return ReplaceSummary(filesChanged: filesChanged, replacements: totalReplacements, filesFailed: filesFailed)
+    }
+
+    /// Applies the replacement to one file's contents **line by line** (mirroring
+    /// `search`'s per-line matching), preserving each line's original terminator
+    /// (`\n`, `\r\n`, none), and returns the new text plus the replacement count.
+    /// Returns the input unchanged when nothing matched.
+    private static func replaced(
+        in text: String,
+        query: String,
+        caseSensitive: Bool,
+        regex: NSRegularExpression?,
+        replacement: String
+    ) -> (text: String, count: Int) {
+        var out = ""
+        var count = 0
+        // `.byLines` yields each line's content range plus the enclosing range (which
+        // includes the terminator); the two tile the whole string, so reassembling
+        // content + terminator reproduces the file exactly except at replaced sites.
+        text.enumerateSubstrings(in: text.startIndex..<text.endIndex, options: .byLines) { _, sub, encl, _ in
+            let line = String(text[sub])
+            let terminator = String(text[sub.upperBound..<encl.upperBound])
+            let (replacedLine, n) = replacedInLine(line, query: query, caseSensitive: caseSensitive,
+                                                   regex: regex, replacement: replacement)
+            out += replacedLine + terminator
+            count += n
+        }
+        return count > 0 ? (out, count) : (text, 0)
+    }
+
+    /// One line's replacement: regex template substitution, or a case-(in)sensitive
+    /// literal replace counting non-overlapping matches the way `matches` advances.
+    private static func replacedInLine(
+        _ line: String,
+        query: String,
+        caseSensitive: Bool,
+        regex: NSRegularExpression?,
+        replacement: String
+    ) -> (String, Int) {
+        let ns = line as NSString
+        let full = NSRange(location: 0, length: ns.length)
+
+        if let regex {
+            let count = regex.numberOfMatches(in: line, options: [], range: full)
+            guard count > 0 else { return (line, 0) }
+            return (regex.stringByReplacingMatches(in: line, options: [], range: full, withTemplate: replacement), count)
+        }
+
+        let opts: NSString.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+        var count = 0, start = 0
+        while start < ns.length {
+            let r = ns.range(of: query, options: opts, range: NSRange(location: start, length: ns.length - start))
+            if r.location == NSNotFound { break }
+            count += 1
+            start = NSMaxRange(r) > r.location ? NSMaxRange(r) : r.location + 1
+        }
+        guard count > 0 else { return (line, 0) }
+        return (ns.replacingOccurrences(of: query, with: replacement, options: opts, range: full), count)
     }
 }

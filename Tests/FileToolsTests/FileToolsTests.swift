@@ -196,6 +196,169 @@ final class FileToolsTests: XCTestCase {
         XCTAssertTrue(results.isEmpty)
     }
 
+    // MARK: - ProjectSearch replaceAll
+
+    private func read(_ relativePath: String) throws -> String {
+        try String(contentsOf: tmp.appendingPathComponent(relativePath), encoding: .utf8)
+    }
+
+    func testReplaceAllLiteralAcrossFiles() throws {
+        try write("foo bar foo\n", to: "a.txt")
+        try write("no match here\n", to: "b.txt")
+        try write("a foo line\n", to: "sub/c.txt")
+
+        let summary = ProjectSearch.replaceAll(
+            query: "foo", in: tmp, caseSensitive: false, regex: false,
+            replacement: "baz", commit: true, isCancelled: { false })
+
+        XCTAssertEqual(summary.filesChanged, 2)
+        XCTAssertEqual(summary.replacements, 3)   // two in a.txt, one in c.txt
+        XCTAssertEqual(summary.filesFailed, 0)
+        XCTAssertEqual(try read("a.txt"), "baz bar baz\n")
+        XCTAssertEqual(try read("b.txt"), "no match here\n")   // untouched, not rewritten
+        XCTAssertEqual(try read("sub/c.txt"), "a baz line\n")
+    }
+
+    func testReplaceAllCaseSensitivity() throws {
+        try write("Foo foo FOO\n", to: "a.txt")
+
+        let sensitive = ProjectSearch.replaceAll(
+            query: "foo", in: tmp, caseSensitive: true, regex: false,
+            replacement: "x", commit: true, isCancelled: { false })
+        XCTAssertEqual(sensitive.replacements, 1)
+        XCTAssertEqual(try read("a.txt"), "Foo x FOO\n")
+    }
+
+    func testReplaceAllRegexTemplateBackreferences() throws {
+        try write("name: alice\nname: bob\n", to: "a.txt")
+
+        let summary = ProjectSearch.replaceAll(
+            query: #"name: (\w+)"#, in: tmp, caseSensitive: false, regex: true,
+            replacement: "user=$1", commit: true, isCancelled: { false })
+
+        XCTAssertEqual(summary.filesChanged, 1)
+        XCTAssertEqual(summary.replacements, 2)
+        XCTAssertEqual(try read("a.txt"), "user=alice\nuser=bob\n")
+    }
+
+    func testReplaceAllPreservesLineEndingsAndTrailingNewline() throws {
+        // CRLF endings and a final line without a newline must survive untouched
+        // except at the replaced sites.
+        try write("foo\r\nbar\r\nfoo", to: "a.txt")
+        _ = ProjectSearch.replaceAll(
+            query: "foo", in: tmp, caseSensitive: false, regex: false,
+            replacement: "X", commit: true, isCancelled: { false })
+        XCTAssertEqual(try read("a.txt"), "X\r\nbar\r\nX")
+    }
+
+    func testReplaceAllNoMatchesChangesNothing() throws {
+        try write("hello\n", to: "a.txt")
+        let summary = ProjectSearch.replaceAll(
+            query: "zzz", in: tmp, caseSensitive: false, regex: false,
+            replacement: "q", commit: true, isCancelled: { false })
+        XCTAssertEqual(summary, .empty)
+        XCTAssertEqual(try read("a.txt"), "hello\n")
+    }
+
+    func testReplaceAllInvalidRegexIsNoOp() throws {
+        try write("anything\n", to: "a.txt")
+        let summary = ProjectSearch.replaceAll(
+            query: "([", in: tmp, caseSensitive: false, regex: true,
+            replacement: "x", commit: true, isCancelled: { false })
+        XCTAssertEqual(summary, .empty)
+        XCTAssertEqual(try read("a.txt"), "anything\n")
+    }
+
+    func testReplaceAllSkipsNoiseDirectories() throws {
+        try write("foo\n", to: "node_modules/pkg/index.js")
+        try write("foo\n", to: "src/main.swift")
+
+        let summary = ProjectSearch.replaceAll(
+            query: "foo", in: tmp, caseSensitive: false, regex: false,
+            replacement: "bar", commit: true, isCancelled: { false })
+
+        XCTAssertEqual(summary.filesChanged, 1)
+        XCTAssertEqual(try read("node_modules/pkg/index.js"), "foo\n")   // untouched
+        XCTAssertEqual(try read("src/main.swift"), "bar\n")
+    }
+
+    func testReplaceAllDryRunCountsButWritesNothing() throws {
+        try write("foo foo\n", to: "a.txt")
+        try write("foo\n", to: "b.txt")
+
+        let dry = ProjectSearch.replaceAll(
+            query: "foo", in: tmp, caseSensitive: false, regex: false,
+            replacement: "bar", commit: false, isCancelled: { false })
+
+        XCTAssertEqual(dry.filesChanged, 2)   // files that WOULD change
+        XCTAssertEqual(dry.replacements, 3)
+        XCTAssertEqual(try read("a.txt"), "foo foo\n")   // nothing written
+        XCTAssertEqual(try read("b.txt"), "foo\n")
+    }
+
+    func testReplaceAllRegexDoesNotMatchAcrossLines() throws {
+        // Per-line matching, mirroring search: `\s+` must NOT consume the newline and
+        // collapse lines — only intra-line whitespace runs are replaced.
+        try write("a  b\nc  d\ne", to: "a.txt")
+        let summary = ProjectSearch.replaceAll(
+            query: #"\s+"#, in: tmp, caseSensitive: false, regex: true,
+            replacement: "_", commit: true, isCancelled: { false })
+
+        XCTAssertEqual(summary.replacements, 2)          // the two intra-line "  " runs
+        XCTAssertEqual(try read("a.txt"), "a_b\nc_d\ne")  // newlines intact, no line join
+    }
+
+    func testReplaceAllDryRunAndCommitCountsMatch() throws {
+        try write("x x\nx\n", to: "a.txt")
+        let dry = ProjectSearch.replaceAll(
+            query: "x", in: tmp, caseSensitive: false, regex: false,
+            replacement: "yy", commit: false, isCancelled: { false })
+        let done = ProjectSearch.replaceAll(
+            query: "x", in: tmp, caseSensitive: false, regex: false,
+            replacement: "yy", commit: true, isCancelled: { false })
+        XCTAssertEqual(dry.replacements, done.replacements)   // confirm count == real count
+        XCTAssertEqual(dry.filesChanged, done.filesChanged)
+    }
+
+    func testReplaceAllNonEncodableReplacementFailsInBothDryAndCommit() throws {
+        // A Latin-1 file whose replacement introduces a char it can't encode (€) must
+        // be reported as FAILED (not changed) — and the dry run must agree with commit
+        // so the confirmation count never overstates what gets written.
+        let url = tmp.appendingPathComponent("a.txt")
+        var bytes = Data("caf".utf8); bytes.append(0xE9); bytes.append(contentsOf: " cafe\n".utf8)  // Latin-1
+        try bytes.write(to: url)
+
+        let dry = ProjectSearch.replaceAll(
+            query: "cafe", in: tmp, caseSensitive: false, regex: false,
+            replacement: "€", commit: false, isCancelled: { false })
+        let done = ProjectSearch.replaceAll(
+            query: "cafe", in: tmp, caseSensitive: false, regex: false,
+            replacement: "€", commit: true, isCancelled: { false })
+
+        XCTAssertEqual(dry.filesChanged, 0)
+        XCTAssertEqual(dry.replacements, 0)
+        XCTAssertEqual(dry.filesFailed, 1)
+        XCTAssertEqual(dry, done)                       // dry run agrees with commit
+        XCTAssertEqual(try Data(contentsOf: url), bytes) // file left untouched
+    }
+
+    func testReplaceAllPreservesLatin1Encoding() throws {
+        // A Latin-1 file (byte 0xE9 = é) with an ASCII match must round-trip in
+        // Latin-1, not be silently re-encoded to UTF-8 (which would change 0xE9).
+        let url = tmp.appendingPathComponent("a.txt")
+        var bytes = Data("caf".utf8); bytes.append(0xE9); bytes.append(contentsOf: " foo\n".utf8)  // "café foo\n" in Latin-1
+        try bytes.write(to: url)
+
+        let summary = ProjectSearch.replaceAll(
+            query: "foo", in: tmp, caseSensitive: false, regex: false,
+            replacement: "bar", commit: true, isCancelled: { false })
+        XCTAssertEqual(summary.replacements, 1)
+
+        let after = try Data(contentsOf: url)
+        var expected = Data("caf".utf8); expected.append(0xE9); expected.append(contentsOf: " bar\n".utf8)
+        XCTAssertEqual(after, expected)   // 0xE9 preserved as one byte, not UTF-8 0xC3 0xA9
+    }
+
     // MARK: - SkippedDirs
 
     func testSkippedDirsContainsCommonNoise() {
