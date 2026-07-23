@@ -196,6 +196,37 @@ final class FileToolsTests: XCTestCase {
         XCTAssertTrue(results.isEmpty)
     }
 
+    func testProjectSearchAnchoredRegexFindsMidFileLines() throws {
+        // The whole-file pre-check compiles the pattern with .anchorsMatchLines
+        // so ^/$ keep their per-line meaning — a mid-file anchored hit must
+        // survive the pre-check, not be filtered as "no whole-text match".
+        try write("first\nTODO: fix\nlast\n", to: "a.txt")
+        let results = ProjectSearch.search(
+            query: "^TODO:.*$", in: tmp, caseSensitive: false, regex: true, isCancelled: { false })
+        XCTAssertEqual(results.first?.matches.first?.line, 2)
+    }
+
+    func testProjectSearchTextBoundaryAndLookaroundPatternsBypassPrefilter() throws {
+        // \A/\z/\Z and negative lookaround mean different things per-line vs
+        // whole-text — those patterns must skip the whole-file pre-check so the
+        // per-line walk still finds their mid-file hits.
+        try write("alpha\nomega\nlast\n", to: "a.txt")
+        for pattern in [#"\Aomega"#, #"omega\z"#, #"omega\Z"#, #"omega(?!\n)"#, #"(?<!\n)omega"#] {
+            let results = ProjectSearch.search(
+                query: pattern, in: tmp, caseSensitive: false, regex: true, isCancelled: { false })
+            XCTAssertEqual(results.first?.matches.first?.line, 2, pattern)
+        }
+    }
+
+    func testProjectSearchLiteralQueryContainingNewlineFindsNothing() throws {
+        // The literal pre-check runs over the whole text, so a query spanning a
+        // newline passes it — the per-line walk must still (correctly) find nothing.
+        try write("hello\nworld\n", to: "a.txt")
+        let results = ProjectSearch.search(
+            query: "hello\nworld", in: tmp, caseSensitive: false, regex: false, isCancelled: { false })
+        XCTAssertTrue(results.isEmpty)
+    }
+
     // MARK: - ProjectSearch replaceAll
 
     private func read(_ relativePath: String) throws -> String {
@@ -306,6 +337,17 @@ final class FileToolsTests: XCTestCase {
 
         XCTAssertEqual(summary.replacements, 2)          // the two intra-line "  " runs
         XCTAssertEqual(try read("a.txt"), "a_b\nc_d\ne")  // newlines intact, no line join
+    }
+
+    func testReplaceAllAnchoredRegexRewritesMidFileLines() throws {
+        // Same pre-check as search: ^ must keep its per-line meaning, so an
+        // anchored match on line 2 still gets replaced.
+        try write("keep\nfoo end\n", to: "a.txt")
+        let summary = ProjectSearch.replaceAll(
+            query: "^foo", in: tmp, caseSensitive: false, regex: true,
+            replacement: "bar", commit: true, isCancelled: { false })
+        XCTAssertEqual(summary.replacements, 1)
+        XCTAssertEqual(try read("a.txt"), "keep\nbar end\n")
     }
 
     func testReplaceAllDryRunAndCommitCountsMatch() throws {

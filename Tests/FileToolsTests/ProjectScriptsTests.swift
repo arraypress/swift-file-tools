@@ -89,6 +89,21 @@ final class ProjectScriptsTests: XCTestCase {
         XCTAssertFalse(names.contains(".PHONY"))      // dot-target excluded
     }
 
+    func testMakefileColonAssignmentsAreNotTargets() throws {
+        // `VAR := value` (and `::=`/`:::=`) puts the '=' AFTER the colon, so the
+        // name-side guards never saw it — these leaked into the task list as
+        // bogus "make CC" entries.
+        try write("""
+        CC := gcc
+        CFLAGS:=-Wall
+        IMMEDIATE ::= now
+        POSIX :::= later
+        build:
+        \t$(CC) main.c
+        """, to: "Makefile")
+        XCTAssertEqual(ProjectScripts.detect(root: tmp).map(\.name), ["build"])
+    }
+
     func testMakefileDeduplicatesTargets() throws {
         try write("all:\n\techo one\nall:\n\techo two\n", to: "Makefile")
         XCTAssertEqual(ProjectScripts.detect(root: tmp).filter { $0.source == "Makefile" }.count, 1)

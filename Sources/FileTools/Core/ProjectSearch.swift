@@ -57,9 +57,11 @@ public enum ProjectSearch {
             : nil
         if regex && regexObj == nil { return [] }   // invalid pattern
 
+        let mightMatch = prefilter(query: query, caseSensitive: caseSensitive, regexMode: regex)
         var results: [SearchFileResult] = []
         var total = 0
         enumerateTextFiles(in: root, isCancelled: isCancelled) { url, text, _ in
+            guard mightMatch(text) else { return true }
             let fileMatches = matches(in: text, query: query,
                                       caseSensitive: caseSensitive, regex: regexObj)
             guard !fileMatches.isEmpty else { return true }
@@ -127,6 +129,41 @@ public enum ProjectSearch {
             }
 
             if !body(url, text, encoding) { break }
+        }
+    }
+
+    /// Whole-file pre-check: returns a predicate that is `true` when a file's
+    /// text MIGHT contain a match and `false` only when it certainly contains
+    /// none — so the (typical) all-miss files skip the per-line walk and its
+    /// per-line String/NSString allocations entirely. Literal mode is a single
+    /// contiguous whole-text search, which can only over-admit (e.g. a query
+    /// containing `\n` passes here but the line walk still finds nothing). Regex
+    /// mode recompiles the pattern with `.anchorsMatchLines` so `^`/`$` keep
+    /// their per-line meaning; that variant over-admits but never under-admits —
+    /// EXCEPT for `\A`/`\z`/`\Z` and negative lookaround, whose meaning genuinely
+    /// differs between a line substring and the whole text, so patterns
+    /// containing them skip the pre-check and keep the plain per-line walk.
+    private static func prefilter(
+        query: String,
+        caseSensitive: Bool,
+        regexMode: Bool
+    ) -> (String) -> Bool {
+        guard regexMode else {
+            let opts: NSString.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+            return { text in
+                (text as NSString).range(of: query, options: opts).location != NSNotFound
+            }
+        }
+        guard !query.contains("\\A"), !query.contains("\\z"), !query.contains("\\Z"),
+              !query.contains("(?!"), !query.contains("(?<!") else { return { _ in true } }
+        var opts: NSRegularExpression.Options = [.anchorsMatchLines]
+        if !caseSensitive { opts.insert(.caseInsensitive) }
+        guard let re = try? NSRegularExpression(pattern: query, options: opts) else {
+            return { _ in true }
+        }
+        return { text in
+            let full = NSRange(location: 0, length: (text as NSString).length)
+            return re.firstMatch(in: text, options: [], range: full) != nil
         }
     }
 
@@ -217,8 +254,10 @@ public enum ProjectSearch {
             regexObj = nil
         }
 
+        let mightMatch = prefilter(query: query, caseSensitive: caseSensitive, regexMode: regex)
         var filesChanged = 0, totalReplacements = 0, filesFailed = 0
         enumerateTextFiles(in: root, isCancelled: isCancelled) { url, text, encoding in
+            guard mightMatch(text) else { return true }
             let (newText, count) = replaced(in: text, query: query, caseSensitive: caseSensitive,
                                             regex: regexObj, replacement: replacement)
             guard count > 0, newText != text else { return true }

@@ -119,11 +119,15 @@ public final class DirectoryEventStream {
                 pathsToWatch,
                 UInt64(kFSEventStreamEventIdSinceNow),
                 debounceDuration,
+                // WatchRoot is required for kFSEventStreamEventFlagRootChanged to be
+                // delivered at all — without it a rename/move of the watched root
+                // leaves the stream silently watching the old, nonexistent path.
                 FSEventStreamCreateFlags(
                     kFSEventStreamCreateFlagUseCFTypes
                     | kFSEventStreamCreateFlagFileEvents
                     | kFSEventStreamCreateFlagUseExtendedData
                     | kFSEventStreamCreateFlagNoDefer
+                    | kFSEventStreamCreateFlagWatchRoot
                 )
             )
         }

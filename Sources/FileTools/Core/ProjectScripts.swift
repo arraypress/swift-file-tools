@@ -73,6 +73,10 @@ public enum ProjectScripts {
             // special/.PHONY target, and not a comment.
             guard let colon = raw.firstIndex(of: ":"), !raw.hasPrefix("\t"), !raw.hasPrefix(" "),
                   !raw.hasPrefix(".") , !raw.hasPrefix("#") else { continue }
+            // `VAR := value` (and `::=`/`:::=`) puts the '=' AFTER the colon, so the
+            // name-side guards below never see it — check the assignment forms here.
+            let afterColon = raw[raw.index(after: colon)...].drop(while: { $0 == ":" })
+            guard afterColon.first != "=" else { continue }
             let name = String(raw[..<colon]).trimmingCharacters(in: .whitespaces)
             guard !name.isEmpty, !name.contains("="), !name.contains(" "), !name.contains("$"),
                   name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." }),
